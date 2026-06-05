@@ -29,3 +29,10 @@ services:
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
     depends_on:
       - kafka
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: servidor-streaming
+    ports:
+      - "1935:1935"
+      - "8888:8888"
