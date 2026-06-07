@@ -105,14 +105,20 @@ class StreamController:
         # Parámetros del Servidor de Streaming (MediaMTX)
         self.rtmp_url = "rtmp://localhost:1935/live/aforo_tienda"
         
-        # Conexión pasiva a Kafka (Si está apagado Docker, no bloquea el flujo del video)
+        # Conexión a Kafka en Confluent Cloud
         try:
             self.producer = KafkaProducer(
-                bootstrap_servers=['localhost:9092'],
+                bootstrap_servers=['pkc-56d1g.eastus.azure.confluent.cloud:9092'],
+                security_protocol='SASL_SSL',
+                sasl_mechanism='PLAIN',
+                sasl_plain_username='FYTHUU7K3L2N43XK',
+                sasl_plain_password='cflthuqy3igT8XQyZvyhpmuUO49okhvUbdbqorZQB9NN4gCtR0oPAHYKf+ClOj7w',
                 value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
             print("[STATUS] Conexión establecida con Kafka de forma exitosa.")
-        except:
+            print("[INFO] Conectado a Confluent Cloud exitosamente")
+        except Exception as e:
+            print(f"[ERROR] Falló la conexión a Kafka: {e}")
             self.producer = None
             print("[WARN] No se pudo conectar a Kafka. El sistema operará en modo local sin telemetría.")
 
@@ -189,7 +195,7 @@ class StreamController:
                         "detecciones": local_counts if local_counts else {"person": 0}
                     }
                     try:
-                        self.producer.send('bodega.eventos.personas', value=evento)
+                        self.producer.send('flowtrack-detecciones-afluencia', value=evento)
                     except:
                         pass
                 last_counts = local_counts.copy()
@@ -200,6 +206,7 @@ class StreamController:
             except:
                 print("[WARN] Tubería de FFmpeg rota de forma inesperada.")
                 break
+            time.sleep(0.03)
 
             # 🚀 SINCRONIZACIÓN MAESTRA A 30 FPS: Evita la saturación del búfer de Windows
             time_elapsed = time.time() - start_time
@@ -222,7 +229,9 @@ class StreamController:
 
     def start(self, cam_index: int, camera_name: str):
         if self.running:
-            self.stop()
+            return False # Ya hay una cámara transmitiendo
+        
+        time.sleep(2)
 
         self.running = True
         self.thread = threading.Thread(
@@ -236,7 +245,12 @@ class StreamController:
             return False
         self.running = False
         if self.thread:
-            self.thread.join(timeout=2)
+            self.thread.join(timeout=5)
+        #return True
+    
+        if self.cap:
+            self.cap.release()
+            self.cap = None
         return True
 
 # Instanciación global del gestor de streaming
