@@ -39,8 +39,8 @@ class StreamController:
                 bootstrap_servers=['pkc-56d1g.eastus.azure.confluent.cloud:9092'],
                 security_protocol='SASL_SSL',
                 sasl_mechanism='PLAIN',
-                sasl_plain_username='TU_API_KEY',
-                sasl_plain_password='TU_API_SECRET',
+                sasl_plain_username='FYTHUU7K3L2N43XK',
+                sasl_plain_password='cflthuqy3igT8XQyZvyhpmuUO49okhvUbdbqorZQB9NN4gCtR0oPAHYKf+ClOj7w',
                 value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
             print("[INFO] Conectado a Confluent Cloud exitosamente")
@@ -118,6 +118,7 @@ class StreamController:
                 self.ffmpeg_proc.stdin.write(annotated_frame.tobytes())
             except:
                 break
+            time.sleep(0.03)
 
         # Limpieza al apagar la cámara
         if self.cap:
@@ -133,7 +134,9 @@ class StreamController:
     def start(self, camera_id):
         if self.running:
             return False # Ya hay una cámara transmitiendo
-            
+        
+        time.sleep(2)
+
         self.running = True
         self.thread = threading.Thread(target=self._worker_loop, args=(camera_id,), daemon=True)
         self.thread.start()
@@ -144,7 +147,12 @@ class StreamController:
             return False
         self.running = False
         if self.thread:
-            self.thread.join(timeout=2)
+            self.thread.join(timeout=5)
+        #return True
+    
+        if self.cap:
+            self.cap.release()
+            self.cap = None
         return True
 
 # Instanciamos el controlador global
@@ -156,11 +164,21 @@ stream_manager = StreamController()
 
 @app.post("/api/v1/vision/start")
 def iniciar_camara(camera_id: str = "0"):
-    """El frontend llama aquí mandando el ID de la cámara que quiere activar (ej: '0' o '1')"""
+    # Si detectamos que cree que está corriendo, forzamos un stop previo por seguridad
+    if stream_manager.running:
+        print("[WARN] Se detectó un estado inconsistente, forzando limpieza...")
+        stream_manager.stop()
+        time.sleep(1) # Pequeña pausa para asegurar liberación
+    
+    exito = stream_manager.start(camera_id)
+    if not exito:
+        raise HTTPException(status_code=400, detail="Error crítico al iniciar la cámara.")
+    """
+    # El frontend llama aquí mandando el ID de la cámara que quiere activar (ej: '0' o '1')
     exito = stream_manager.start(camera_id)
     if not exito:
         raise HTTPException(status_code=400, detail="El streaming ya está activo o no se pudo iniciar.")
-    
+    """
     # Le respondemos al front con la URL HLS que generará MediaMTX para que la incruste en su HTML
     return {
         "status": "success",
