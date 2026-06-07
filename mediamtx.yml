@@ -1,0 +1,19 @@
+# Configuración mínima de MediaMTX para FlowTrack Edge Vision.
+# Montada en Docker para evitar el comportamiento por defecto de la imagen latest.
+
+logLevel: info
+
+# RTMP: recibe el stream de FFmpeg (Python)
+rtmp: true
+rtmpAddress: :1935
+
+# HLS: lo consume el frontend Angular vía hls.js
+hls: true
+hlsAddress: :8888
+hlsAllowOrigins: ['*']
+# Genera HLS en cuanto hay publisher, sin esperar al primer lector
+hlsAlwaysRemux: true
+hlsVariant: lowLatency
+
+paths:
+  live/aforo_tienda: {}

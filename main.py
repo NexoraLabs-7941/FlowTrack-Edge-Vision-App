@@ -1,10 +1,12 @@
 import cv2
 import json
 import os
+import re
 import subprocess
 import threading
 import time
 from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from kafka import KafkaProducer
@@ -12,17 +14,88 @@ from ultralytics import YOLO
 
 app = FastAPI(title="FlowTrack Edge Vision Controller")
 
-# Habilitar CORS para que tu Front en producción pueda enviar comandos sin bloqueos
+# Habilitar CORS para que tu Front en desarrollo/producción envíe comandos sin bloqueos
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # En producción lo cambias por la URL de tu hosting
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def list_dshow_video_devices() -> list[str]:
+    """Lista cámaras de video en Windows vía FFmpeg/DirectShow (mismo orden que OpenCV CAP_DSHOW)."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10
+        )
+    except Exception as exc:
+        print(f"[WARN] No se pudieron enumerar cámaras DirectShow: {exc}")
+        return []
+
+    devices: list[str] = []
+    for line in (result.stderr or '').splitlines():
+        match = re.search(r'"([^"]+)" \(video\)', line)
+        if match:
+            devices.append(match.group(1))
+    return devices
+
+
+def _normalize_camera_label(label: str) -> str:
+    text = label.lower()
+    text = re.sub(r'laptop\s*[—\-]\s*', '', text)
+    text = re.sub(r'celular\s*[—\-]\s*', '', text)
+    text = re.sub(r'\([0-9a-f]{4}:[0-9a-f]{4}\)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    return ' '.join(text.split())
+
+
+def resolve_camera_index(camera_id: str, camera_label: Optional[str] = None) -> int:
+    """
+    Resuelve el índice OpenCV correcto. El orden del navegador (MediaDevices) no coincide
+    con DirectShow: Iriun suele ser índice 0 aunque en el browser aparezca segundo.
+    """
+    devices = list_dshow_video_devices()
+    if devices:
+        print(f"[INFO] Cámaras DirectShow detectadas: {devices}")
+
+    if camera_label and devices:
+        want_iriun = 'iriun' in camera_label.lower()
+        label_tokens = [t for t in _normalize_camera_label(camera_label).split() if len(t) > 2]
+
+        best_idx: Optional[int] = None
+        best_score = -1
+        for idx, name in enumerate(devices):
+            norm_name = _normalize_camera_label(name)
+            is_iriun = 'iriun' in norm_name
+            if want_iriun and not is_iriun:
+                continue
+            if not want_iriun and is_iriun:
+                continue
+
+            score = sum(1 for token in label_tokens if token in norm_name)
+            if norm_name in _normalize_camera_label(camera_label):
+                score += 10
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is not None and best_score > 0:
+            print(f"[INFO] Cámara resuelta por nombre '{camera_label}' -> '{devices[best_idx]}' (índice {best_idx})")
+            return best_idx
+
+    if camera_id.isdigit():
+        idx = int(camera_id)
+        if devices and 0 <= idx < len(devices):
+            print(f"[INFO] Cámara por índice {idx}: '{devices[idx]}'")
+        return idx
+
+    return 0
+
 class StreamController:
     def __init__(self):
+        # Carga el modelo YOLOv8s. Si no existe en la carpeta, se descargará automáticamente
         self.model = YOLO('yolov8s.pt')
         self.running = False
         self.cap = None
@@ -30,45 +103,52 @@ class StreamController:
         self.thread = None
         
         # Parámetros del Servidor de Streaming (MediaMTX)
-        # En producción cambias 'localhost' por la IP pública de tu servidor central
         self.rtmp_url = "rtmp://localhost:1935/live/aforo_tienda"
         
-        # Conexión pasiva a Kafka
+        # Conexión pasiva a Kafka (Si está apagado Docker, no bloquea el flujo del video)
         try:
             self.producer = KafkaProducer(
                 bootstrap_servers=['localhost:9092'],
                 value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
+            print("[STATUS] Conexión establecida con Kafka de forma exitosa.")
         except:
             self.producer = None
+            print("[WARN] No se pudo conectar a Kafka. El sistema operará en modo local sin telemetría.")
 
     def _iniciar_ffmpeg(self, width, height):
+        # 🔥 SOLUCIÓN CRUCIAL: Aseguramos que el ancho y alto se fuercen a números pares en el encoder
+        # El filtro scale=-2:trunc(ih/2)*2 corrige cualquier dimensión impar automáticamente
         command = [
             'ffmpeg', '-y',
             '-f', 'rawvideo', '-vcodec', 'rawvideo',
             '-pix_fmt', 'bgr24', '-s', f"{width}x{height}", '-r', '30',
             '-i', '-', 
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', # Fuerza resoluciones pares obligatorias para x264
             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            '-preset', 'ultrafast', '-f', 'flv',
+            '-preset', 'ultrafast', 
+            '-tune', 'zerolatency', # Optimización clave para streaming en tiempo real
+            '-f', 'flv',
             self.rtmp_url
         ]
-        # Redirigimos stderr a devnull para no llenar la consola con logs técnicos de FFmpeg
-        self.ffmpeg_proc = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.ffmpeg_proc = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    def _worker_loop(self, camera_id):
-        """Bucle que procesa los frames y los envía a MediaMTX"""
-        # Intentamos abrir el ID de cámara que mandó el usuario (0, 1, o una ruta de archivo)
-        try:
-            # Si el usuario mandó un número como string "0", lo convertimos a entero
-            cam_source = int(camera_id) if camera_id.isdigit() else camera_id
-        except:
-            cam_source = camera_id
+    def _worker_loop(self, cam_index: int, camera_name: str):
+        """Bucle optimizado y temporizado que procesa frames y los inyecta a MediaMTX"""
+        cam_source = cam_index
 
-        self.cap = cv2.VideoCapture(cam_source)
+        # Inicialización de la captura usando DirectShow en Windows para agilizar webcams
+        self.cap = cv2.VideoCapture(cam_source, cv2.CAP_DSHOW)
+        
+        # Calentamiento inicial del hardware / búfer de lectura
+        for _ in range(5):
+            self.cap.read()
+            time.sleep(0.05)
+
         success, frame = self.cap.read()
         
         if not success:
-            print(f"[ERROR] No se pudo leer el origen de video: {camera_id}")
+            print(f"[ERROR] No se pudo leer la cámara '{camera_name}' (índice {cam_index})")
             self.running = False
             return
 
@@ -77,12 +157,19 @@ class StreamController:
         
         last_counts = {}
 
+        # Reducir el búfer interno de OpenCV al mínimo para mitigar el lag acumulado
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        print(f"[INFO] Procesamiento YOLO activo en '{camera_name}' (índice OpenCV {cam_index})")
+
         while self.cap.isOpened() and self.running:
+            start_time = time.time()  # ⏱️ Capturamos el milisegundo exacto de inicio del frame
+            
             success, frame = self.cap.read()
             if not success:
                 break
 
-            # Inferencia optimizada de YOLOv8s (Clase 0 = Personas)
+            # Inferencia optimizada reduciendo el tamaño de análisis (imgsz=320) enfocado solo en personas (class 0)
             results = self.model(frame, stream=True, conf=0.5, imgsz=320, classes=[0], verbose=False)
             
             local_counts = {}
@@ -93,11 +180,11 @@ class StreamController:
                 for box in r.boxes:
                     local_counts["person"] = local_counts.get("person", 0) + 1
 
-            # Lógica de Kafka (Lista para el futuro, no bloquea)
+            # Despacho asíncrono de telemetría hacia el broker de Kafka si el conteo cambia
             if local_counts != last_counts:
                 if self.producer:
                     evento = {
-                        "dispositivo_id": f"camara_{camera_id}",
+                        "dispositivo_id": f"camara_{cam_index}",
                         "timestamp": datetime.now().isoformat(),
                         "detecciones": local_counts if local_counts else {"person": 0}
                     }
@@ -107,13 +194,20 @@ class StreamController:
                         pass
                 last_counts = local_counts.copy()
 
-            # Empujar frame analizado a MediaMTX
+            # Transferencia binaria del frame procesado hacia FFmpeg
             try:
                 self.ffmpeg_proc.stdin.write(annotated_frame.tobytes())
             except:
+                print("[WARN] Tubería de FFmpeg rota de forma inesperada.")
                 break
 
-        # Limpieza al apagar la cámara
+            # 🚀 SINCRONIZACIÓN MAESTRA A 30 FPS: Evita la saturación del búfer de Windows
+            time_elapsed = time.time() - start_time
+            time_to_wait = (1.0 / 30.0) - time_elapsed
+            if time_to_wait > 0:
+                time.sleep(time_to_wait)
+
+        # Cierre ordenado de recursos e hilos del sistema
         if self.cap:
             self.cap.release()
         if self.ffmpeg_proc:
@@ -122,14 +216,18 @@ class StreamController:
                 self.ffmpeg_proc.wait()
             except:
                 pass
-        print(f"[INFO] Streaming del origen {camera_id} finalizado limpiamente.")
+        
+        self.running = False
+        print(f"[INFO] Streaming de '{camera_name}' finalizado.")
 
-    def start(self, camera_id):
+    def start(self, cam_index: int, camera_name: str):
         if self.running:
-            return False # Ya hay una cámara transmitiendo
-            
+            self.stop()
+
         self.running = True
-        self.thread = threading.Thread(target=self._worker_loop, args=(camera_id,), daemon=True)
+        self.thread = threading.Thread(
+            target=self._worker_loop, args=(cam_index, camera_name), daemon=True
+        )
         self.thread.start()
         return True
 
@@ -141,47 +239,57 @@ class StreamController:
             self.thread.join(timeout=2)
         return True
 
-# Instanciamos el controlador global
+# Instanciación global del gestor de streaming
 stream_manager = StreamController()
 
 # -----------------------------------------------------------------
-# 🌐 ENDPOINTS DE CONTROL PARA EL FRONTEND
+# 🌐 ENDPOINTS DE CONTROL API (FastAPI)
 # -----------------------------------------------------------------
 
+@app.get("/api/v1/vision/cameras")
+def listar_camaras():
+    """Lista cámaras disponibles en el host (DirectShow) con su índice OpenCV."""
+    devices = list_dshow_video_devices()
+    return {
+        "cameras": [
+            {"index": idx, "name": name, "iriun": "iriun" in name.lower()}
+            for idx, name in enumerate(devices)
+        ]
+    }
+
 @app.post("/api/v1/vision/start")
-def iniciar_camara(camera_id: str = "0"):
-    """El frontend llama aquí mandando el ID de la cámara que quiere activar (ej: '0' o '1')"""
-    exito = stream_manager.start(camera_id)
-    if not exito:
-        raise HTTPException(status_code=400, detail="El streaming ya está activo o no se pudo iniciar.")
+def iniciar_camara(camera_id: str = "0", camera_label: Optional[str] = None):
+    """Acción invocada por el orquestador Java para inicializar el aforo perimetral"""
+    cam_index = resolve_camera_index(camera_id, camera_label)
+    devices = list_dshow_video_devices()
+    camera_name = devices[cam_index] if devices and cam_index < len(devices) else (camera_label or f"camera_{cam_index}")
+
+    stream_manager.start(cam_index, camera_name)
     
-    # Le respondemos al front con la URL HLS que generará MediaMTX para que la incruste en su HTML
     return {
         "status": "success",
-        "message": f"Cámara {camera_id} activada exitosamente.",
-        "stream_url": "http://localhost:8888/live/aforo_tienda/index.m3u8"
+        "message": f"Cámara '{camera_name}' activada (índice OpenCV {cam_index}).",
+        "stream_url": "http://localhost:8888/live/aforo_tienda/index.m3u8",
+        "camera_index": cam_index,
+        "camera_name": camera_name
     }
 
 @app.post("/api/v1/vision/stop")
 def detener_camara():
-    """El frontend llama aquí cuando el usuario sale de la sección de aforo para apagar la cámara"""
+    """Acción invocada para desmantelar y apagar el flujo de streaming activo"""
     exito = stream_manager.stop()
     if not exito:
         raise HTTPException(status_code=400, detail="No hay ningún streaming activo para detener.")
     return {"status": "success", "message": "Streaming detenido correctamente."}
 
+
 if __name__ == "__main__":
     import uvicorn
     
-    # -----------------------------------------------------------------
-    # 🌐 MODO DE CONTROL PURO POR ENDPOINTS (Listo para el Frontend)
-    # -----------------------------------------------------------------
     print("\n" + "="*50)
     print("[STATUS] Microservicio Edge Vision de FlowTrack Iniciado.")
     print("[STATUS] Esperando órdenes del Frontend o Swagger...")
     print("[SERVER] Entra a probarlo aquí: http://localhost:8000/docs")
     print("="*50 + "\n")
     
-    # Arrancamos Uvicorn de forma normal. Ahora el código se quedará quieto 
-    # y la cámara SOLO se encenderá cuando tú lo solicites en la web.
     uvicorn.run(app, host="0.0.0.0", port=8000)
