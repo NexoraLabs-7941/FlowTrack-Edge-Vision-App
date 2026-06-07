@@ -33,13 +33,19 @@ class StreamController:
         # En producción cambias 'localhost' por la IP pública de tu servidor central
         self.rtmp_url = "rtmp://localhost:1935/live/aforo_tienda"
         
-        # Conexión pasiva a Kafka
+        # Conexión a Kafka en Confluent Cloud
         try:
             self.producer = KafkaProducer(
-                bootstrap_servers=['localhost:9092'],
+                bootstrap_servers=['pkc-56d1g.eastus.azure.confluent.cloud:9092'],
+                security_protocol='SASL_SSL',
+                sasl_mechanism='PLAIN',
+                sasl_plain_username='TU_API_KEY',
+                sasl_plain_password='TU_API_SECRET',
                 value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
-        except:
+            print("[INFO] Conectado a Confluent Cloud exitosamente")
+        except Exception as e:
+            print(f"[ERROR] Falló la conexión a Kafka: {e}")
             self.producer = None
 
     def _iniciar_ffmpeg(self, width, height):
@@ -102,7 +108,7 @@ class StreamController:
                         "detecciones": local_counts if local_counts else {"person": 0}
                     }
                     try:
-                        self.producer.send('bodega.eventos.personas', value=evento)
+                        self.producer.send('flowtrack-detecciones-afluencia', value=evento)
                     except:
                         pass
                 last_counts = local_counts.copy()
