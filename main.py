@@ -7,7 +7,9 @@ import threading
 import time
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+import base64
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from kafka import KafkaProducer
 from ultralytics import YOLO
@@ -231,7 +233,7 @@ class StreamController:
         if self.running:
             return False # Ya hay una cámara transmitiendo
         
-        time.sleep(2)
+        ##time.sleep(2)
 
         self.running = True
         self.thread = threading.Thread(
@@ -295,6 +297,88 @@ def detener_camara():
     if not exito:
         raise HTTPException(status_code=400, detail="No hay ningún streaming activo para detener.")
     return {"status": "success", "message": "Streaming detenido correctamente."}
+
+
+def _run_inventory_detection(frame: np.ndarray) -> dict:
+    """
+    Ejecuta YOLO sobre un frame/imagen y cuenta objetos detectados.
+    Ignora estrictamente a las personas (clase 0) para el módulo de Restock.
+    """
+    names = stream_manager.model.names
+    
+    # Seleccionamos las clases típicas de productos (ej: botella es la clase 39 en COCO)
+    # Si usas clases personalizadas, puedes listarlas aquí directamente.
+    clases_inventario = [int(cls_id) for cls_id in names.keys() if int(cls_id) != 0]
+
+    # Ejecutamos inferencia aislando las clases de inventario a nivel de tensores
+    results = stream_manager.model(
+        frame, 
+        conf=0.45,       # Subimos ligeramente la confianza para mitigar falsos positivos en el aula
+        imgsz=640, 
+        classes=clases_inventario, 
+        verbose=False
+    )
+
+    class_counts: dict[str, int] = {}
+    confidences: list[float] = []
+    annotated_frame = frame.copy()
+
+    for result in results:
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            
+            # 🛑 VALIDACIÓN AGRESIVA: Si por alguna razón OpenCV o YOLO cruzan la clase 0, la saltamos
+            if cls_id == 0:
+                continue
+                
+            class_name = result.names.get(cls_id, f"item_{cls_id}")
+            
+            # Traducimos la clase común 'bottle' al nombre comercial de tu negocio si es necesario
+            if class_name == 'bottle':
+                class_name = 'Yogurt'  # Mapeo dinámico para que coincida con tu tabla de Angular
+
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            confidences.append(float(box.conf[0]))
+            
+            # 🎨 Pintamos el recuadro verde de FlowTrack únicamente en los ítems válidos
+            xyxy = box.xyxy[0].cpu().numpy().astype(int)
+            cv2.rectangle(annotated_frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (34, 197, 94), 2)
+            cv2.putText(
+                annotated_frame, 
+                f"{class_name} {float(box.conf[0]):.2f}", 
+                (xyxy[0], xyxy[1] - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (34, 197, 94), 2
+            )
+
+    total_count = sum(class_counts.values())
+    avg_confidence = round(sum(confidences) / len(confidences), 4) if confidences else 0.0
+
+    _, buffer = cv2.imencode('.jpg', annotated_frame)
+    annotated_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    return {
+        "status": "success",
+        "total_count": total_count,
+        "detections": class_counts,
+        "confidence": avg_confidence,
+        "annotated_image_base64": annotated_b64
+    }
+
+@app.post("/api/v1/vision/detect-image")
+async def detectar_imagen(image: UploadFile = File(...)):
+    """Detecta y cuenta objetos en una imagen subida (reposición de inventario)."""
+    contents = await image.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="La imagen está vacía.")
+
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen.")
+
+    return _run_inventory_detection(frame)
 
 
 if __name__ == "__main__":
