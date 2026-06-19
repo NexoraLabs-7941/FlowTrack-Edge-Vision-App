@@ -216,19 +216,21 @@ class StreamController:
             if time_to_wait > 0:
                 time.sleep(time_to_wait)
 
-        # Cierre ordenado de recursos e hilos del sistema
         if self.cap:
             self.cap.release()
+            
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.stdin.close()
-                self.ffmpeg_proc.wait()
+                self.ffmpeg_proc.terminate()  # 🔥 Le pide amablemente a FFmpeg que muera
+                self.ffmpeg_proc.wait(timeout=2) # Le da 2 segundos de cortesía
             except:
-                pass
+                self.ffmpeg_proc.kill() # 💥 Si se resiste, lo aniquila del sistema operativo de raíz
         
         self.running = False
-        print(f"[INFO] Streaming de '{camera_name}' finalizado.")
+        print(f"[INFO] Streaming de '{camera_name}' finalizado y puertos liberados.")
 
+        
     def start(self, cam_index: int, camera_name: str):
         if self.running:
             return False # Ya hay una cámara transmitiendo
