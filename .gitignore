@@ -1,0 +1,8 @@
+# Ignorar logs locales
+ffmpeg_error.log
+
+# Ignorar caché de Python
+__pycache__/
+
+# Ignorar el modelo pesado de YOLO (para que no sature tu repositorio)
+yolov8s.pt
