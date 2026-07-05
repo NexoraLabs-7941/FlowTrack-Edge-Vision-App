@@ -98,6 +98,14 @@ class StreamController:
         self.log_file = open("ffmpeg_error.log", "w")
         self.ffmpeg_proc = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=self.log_file)
 
+    def _enviar_kafka_async(self, evento):
+        """Envía datos a la nube en segundo plano para aislar la cámara de la latencia de red."""
+        try:
+            self.producer.send('flowtrack-detecciones-afluencia', value=evento)
+            self.producer.flush()
+        except Exception as e:
+            print(f"[WARN] Retraso de red en Kafka: {e}")
+
     def _worker_loop(self, cam_index: int, camera_name: str):
         cam_source = cam_index
         self.cap = cv2.VideoCapture(cam_source, cv2.CAP_DSHOW)
@@ -115,12 +123,14 @@ class StreamController:
         height, width, _ = frame.shape
         self._iniciar_ffmpeg(width, height)
         last_counts = {}
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # 🔥 ELIMINADO: Quitamos la orden de búfer que crasheaba a Windows DirectShow
 
         while self.cap.isOpened() and self.running:
             start_time = time.time() 
             success, frame = self.cap.read()
             if not success:
+                # Si falla, salimos limpiamente
                 break
 
             results = self.model(frame, stream=True, conf=0.5, imgsz=320, classes=[0], verbose=False)
@@ -140,10 +150,12 @@ class StreamController:
                         "timestamp": datetime.now().isoformat(),
                         "detecciones": local_counts if local_counts else {"person": 0}
                     }
-                    try:
-                        self.producer.send('flowtrack-detecciones-afluencia', value=evento)
-                    except:
-                        pass
+                    threading.Thread(
+                        target=self._enviar_kafka_async, 
+                        args=(evento,), 
+                        daemon=True
+                    ).start()
+                    
                 last_counts = local_counts.copy()
 
             try:
@@ -157,7 +169,9 @@ class StreamController:
             if time_to_wait > 0:
                 time.sleep(time_to_wait)
 
-        if self.cap: self.cap.release()
+        # Limpieza segura
+        if self.cap: 
+            self.cap.release()
         if self.ffmpeg_proc:
             try:
                 self.ffmpeg_proc.stdin.close()
@@ -165,9 +179,6 @@ class StreamController:
                 self.ffmpeg_proc.wait(timeout=2)
             except:
                 self.ffmpeg_proc.kill() 
-            finally:
-                if self.log_file and not self.log_file.closed:
-                    self.log_file.close()
         self.running = False
 
     def start(self, cam_index: int, camera_name: str):
@@ -206,11 +217,14 @@ def iniciar_camara(camera_id: str = "0", camera_label: Optional[str] = None):
     camera_name = camera_label or f"camera_{idx}"
     
     stream_manager.start(idx, camera_name)
+
+    url_video_nube = "https://31eca7617a9c45.lhr.life"
+
     
     return {
         "status": "success",
         "message": f"Cámara '{camera_name}' activada.",
-        "stream_url": "http://localhost:8888/live/aforo_tienda/index.m3u8",
+        "stream_url": f"{url_video_nube}/live/aforo_tienda/index.m3u8",        
         "camera_index": idx,
         "camera_name": camera_name
     }
